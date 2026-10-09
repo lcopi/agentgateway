@@ -15,114 +15,71 @@ use tracing::{error, warn};
 use crate::database::DatabasePool;
 use crate::telemetry::log_store;
 
-/// The scope visible to every gateway. Rows without an explicit scope are global.
+/// The default scope of a row.
 pub const GLOBAL_SCOPE: &str = "global";
 
-const MIGRATIONS_TABLE: &str = "_agentgateway_config_migrations";
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConfigResourceStore {
 	pool: DatabasePool,
 	change_tx: watch::Sender<()>,
 	notification_id: Option<String>,
-	/// Rows whose scopes overlap this set are loaded by `list` and trigger reloads.
+	/// Rows whose scopes overlap these are listed by `list` and trigger reloads.
 	visible_scopes: Arc<ArcSwap<Vec<String>>>,
-	/// Optional hook run inside each write transaction before a row changes.
 	write_hook: Option<Arc<dyn ConfigWriteHook>>,
 }
 
-impl fmt::Debug for ConfigResourceStore {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_struct("ConfigResourceStore")
-			.field("pool", &self.pool)
-			.field("notification_id", &self.notification_id)
-			.field("visible_scopes", &self.visible_scopes.load())
-			.field("write_hook", &self.write_hook)
-			.finish_non_exhaustive()
-	}
-}
-
-/// Selects which rows a list returns, based on their scopes.
+/// Which rows a list returns, by scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeFilter {
-	/// Rows overlapping the store's visible scopes (the default view used to build config).
+	/// Rows overlapping the store's visible scopes.
 	Visible,
-	/// Every row, regardless of scopes. Intended for management views.
 	All,
-	/// Rows overlapping the given scopes.
 	Overlapping(Vec<String>),
 }
 
-/// A row change described to a [`ConfigWriteHook`].
+/// A row change passed to a [`ConfigWriteHook`]. `None` scopes mean the row does not exist
+/// before (insert) or after (delete) the write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigWrite {
 	pub kind: ConfigResourceKind,
 	pub id: String,
-	/// Scopes of the existing row being replaced or deleted, if any.
 	pub previous_scopes: Option<Vec<String>>,
-	/// Scopes of the row after the write; `None` for deletes.
 	pub scopes: Option<Vec<String>>,
 }
 
-/// The transaction a write runs in, handed to a [`ConfigWriteHook`].
-pub enum ConfigWriteConnection<'a> {
-	Sqlite(&'a mut sqlx::SqliteConnection),
-	Postgres(&'a mut sqlx::PgConnection),
-}
-
-/// Runs inside the write transaction before each row is inserted, updated, renamed, or deleted.
-/// Returning an error aborts the whole write. Use it to take locks or enforce cross-row rules.
+/// Runs inside each Postgres write transaction before a row changes; an error aborts the write.
 #[async_trait::async_trait]
 pub trait ConfigWriteHook: Send + Sync + fmt::Debug {
 	async fn before_write(
 		&self,
-		conn: ConfigWriteConnection<'_>,
+		conn: &mut sqlx::PgConnection,
 		write: &ConfigWrite,
 	) -> anyhow::Result<()>;
 }
 
-/// Returns the default scopes for a row: `["global"]`.
 pub fn global_scopes() -> Vec<String> {
 	vec![GLOBAL_SCOPE.to_string()]
 }
 
-/// Returns scopes in canonical form: sorted and de-duplicated. An empty set means global.
-/// Scopes must be non-empty and contain no whitespace, control characters, or commas.
-pub fn canonical_scopes<I, S>(scopes: I) -> Result<Vec<String>, ConfigResourceError>
-where
-	I: IntoIterator<Item = S>,
-	S: Into<String>,
-{
-	let mut scopes = scopes.into_iter().map(Into::into).collect::<Vec<String>>();
-	if let Some(invalid) = scopes.iter().find(|scope| {
-		scope.is_empty()
-			|| scope
-				.chars()
-				.any(|c| c == ',' || c.is_whitespace() || c.is_control())
-	}) {
-		return Err(ConfigResourceError::InvalidRequest(format!(
-			"invalid config resource scope {invalid:?}"
-		)));
-	}
+/// Sorted and de-duplicated; empty means global.
+pub fn canonical_scopes(scopes: impl IntoIterator<Item = impl Into<String>>) -> Vec<String> {
+	let mut scopes: Vec<String> = scopes.into_iter().map(Into::into).collect();
 	scopes.sort();
 	scopes.dedup();
 	if scopes.is_empty() {
-		return Ok(global_scopes());
+		return global_scopes();
 	}
-	Ok(scopes)
+	scopes
 }
 
-/// True when the scopes are exactly global (or empty, which means global).
 pub fn is_global_scopes(scopes: &[String]) -> bool {
-	scopes.is_empty() || (scopes.len() == 1 && scopes[0] == GLOBAL_SCOPE)
+	scopes.is_empty() || scopes == [GLOBAL_SCOPE]
 }
 
-/// True when the two scope sets share at least one scope.
 pub fn scopes_overlap(left: &[String], right: &[String]) -> bool {
 	left.iter().any(|scope| right.contains(scope))
 }
 
-/// Keeps only resources whose scopes overlap `visible`.
 pub fn filter_visible(resources: Vec<ConfigResource>, visible: &[String]) -> Vec<ConfigResource> {
 	resources
 		.into_iter()
@@ -135,7 +92,6 @@ pub fn filter_visible(resources: Vec<ConfigResource>, visible: &[String]) -> Vec
 pub struct ConfigResource {
 	pub kind: ConfigResourceKind,
 	pub id: String,
-	/// Canonical (sorted, de-duplicated) scopes of this row. Defaults to `["global"]`.
 	#[serde(default = "global_scopes")]
 	pub scopes: Vec<String>,
 	pub value: Value,
@@ -284,7 +240,9 @@ impl ConfigResourceStore {
 		let visible_scopes = Arc::new(ArcSwap::from_pointee(global_scopes()));
 		match &pool {
 			DatabasePool::Sqlite(pool) => {
-				migrate_sqlite(pool).await?;
+				let mut migrator = sqlx::migrate!("./src/config_store/sqlite_migrations");
+				migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
+				migrator.run(pool).await?;
 				Ok(Self {
 					pool: DatabasePool::Sqlite(pool.clone()),
 					change_tx,
@@ -294,7 +252,9 @@ impl ConfigResourceStore {
 				})
 			},
 			DatabasePool::Postgres(pool) => {
-				migrate_postgres(pool).await?;
+				let mut migrator = sqlx::migrate!("./src/config_store/postgres_migrations");
+				migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
+				migrator.run(pool).await?;
 				let notification_id = uuid::Uuid::new_v4().to_string();
 				let mut listener = PgListener::connect_with(pool).await?;
 				listener.listen(POSTGRES_CHANGE_CHANNEL).await?;
@@ -305,7 +265,7 @@ impl ConfigResourceStore {
 					loop {
 						match listener.try_recv().await {
 							Ok(Some(notification)) => {
-								if notification_requires_reload(
+								if requires_reload(
 									notification.payload(),
 									&listener_notification_id,
 									&listener_visible_scopes.load(),
@@ -335,30 +295,20 @@ impl ConfigResourceStore {
 		}
 	}
 
-	/// Installs a hook that runs inside every write transaction.
+	/// Installs a hook that runs inside every Postgres write transaction.
 	pub fn with_write_hook(mut self, hook: Arc<dyn ConfigWriteHook>) -> Self {
 		self.write_hook = Some(hook);
 		self
 	}
 
-	/// Sets the scopes this process loads. Defaults to `["global"]`. Shared by all clones.
-	pub fn set_visible_scopes<I, S>(&self, scopes: I) -> anyhow::Result<()>
-	where
-		I: IntoIterator<Item = S>,
-		S: Into<String>,
-	{
+	/// Sets the scopes `list` returns and reloads follow. Defaults to `["global"]`.
+	pub fn set_visible_scopes(&self, scopes: impl IntoIterator<Item = impl Into<String>>) {
 		self
 			.visible_scopes
-			.store(Arc::new(canonical_scopes(scopes)?));
-		Ok(())
+			.store(Arc::new(canonical_scopes(scopes)));
 	}
 
-	/// Returns the scopes this process loads.
-	pub fn visible_scopes(&self) -> Vec<String> {
-		self.visible_scopes.load().as_ref().clone()
-	}
-
-	/// The per-process ID carried as `origin` in change notifications (Postgres only).
+	/// The per-process ID sent with change notifications (Postgres only).
 	pub fn notification_id(&self) -> Option<&str> {
 		self.notification_id.as_deref()
 	}
@@ -371,7 +321,6 @@ impl ConfigResourceStore {
 		self.change_tx.subscribe()
 	}
 
-	/// Lists live rows visible to this process (see [`Self::set_visible_scopes`]).
 	pub async fn list(
 		&self,
 		kind: Option<ConfigResourceKind>,
@@ -379,16 +328,15 @@ impl ConfigResourceStore {
 		self.list_scoped(kind, ScopeFilter::Visible).await
 	}
 
-	/// Lists live rows matching `filter`. Use [`ScopeFilter::All`] for management views.
 	pub async fn list_scoped(
 		&self,
 		kind: Option<ConfigResourceKind>,
 		filter: ScopeFilter,
 	) -> anyhow::Result<Vec<ConfigResource>> {
 		let scopes = match filter {
-			ScopeFilter::Visible => Some(self.visible_scopes()),
+			ScopeFilter::Visible => Some(self.visible_scopes.load().to_vec()),
 			ScopeFilter::All => None,
-			ScopeFilter::Overlapping(scopes) => Some(canonical_scopes(scopes)?),
+			ScopeFilter::Overlapping(scopes) => Some(scopes),
 		};
 		match &self.pool {
 			DatabasePool::Sqlite(pool) => list_sqlite(pool, kind, scopes.as_deref()).await,
@@ -396,8 +344,8 @@ impl ConfigResourceStore {
 		}
 	}
 
-	/// Inserts or updates rows addressed by `(kind, id, scopes)`. When a resource carries
-	/// `previous_scopes` different from `scopes`, that existing row moves to the new scopes in place.
+	/// Writes rows addressed by `(kind, id, scopes)`. A resource whose `previous_scopes` differ
+	/// from `scopes` moves that row to the new scopes in place.
 	pub(crate) async fn upsert_prepared(
 		&self,
 		prepared: Vec<PreparedResource>,
@@ -405,11 +353,19 @@ impl ConfigResourceStore {
 		for resource in &prepared {
 			validate_id(&resource.id)?;
 		}
-		let hook = self.write_hook.as_deref();
 		let (resources, changed_scopes) = match &self.pool {
-			DatabasePool::Sqlite(pool) => upsert_sqlite(pool, prepared, hook).await?,
+			DatabasePool::Sqlite(pool) => upsert_sqlite(pool, prepared).await?,
 			DatabasePool::Postgres(pool) => {
-				upsert_postgres(pool, prepared, self.postgres_notification_id(), hook).await?
+				upsert_postgres(
+					pool,
+					prepared,
+					self
+						.notification_id
+						.as_deref()
+						.expect("postgres store has a notification ID"),
+					self.write_hook.as_deref(),
+				)
+				.await?
 			},
 		};
 		if !resources.is_empty() {
@@ -426,10 +382,10 @@ impl ConfigResourceStore {
 	) -> anyhow::Result<ConfigResourcesResponse> {
 		validate_id(previous_id)?;
 		validate_id(&prepared.id)?;
-		let hook = self.write_hook.as_deref();
-		let (resource, changed_scopes) = match &self.pool {
+		let changed_scopes = canonical_scopes([prepared.target_scopes(), &prepared.scopes].concat());
+		let resource = match &self.pool {
 			DatabasePool::Sqlite(pool) => {
-				rename_sqlite(pool, previous_kind, previous_id, prepared, hook).await?
+				rename_sqlite(pool, previous_kind, previous_id, prepared).await?
 			},
 			DatabasePool::Postgres(pool) => {
 				rename_postgres(
@@ -437,8 +393,11 @@ impl ConfigResourceStore {
 					previous_kind,
 					previous_id,
 					prepared,
-					self.postgres_notification_id(),
-					hook,
+					self
+						.notification_id
+						.as_deref()
+						.expect("postgres store has a notification ID"),
+					self.write_hook.as_deref(),
 				)
 				.await?
 			},
@@ -449,12 +408,10 @@ impl ConfigResourceStore {
 		})
 	}
 
-	/// Deletes the global row `(kind, id)`.
 	pub async fn delete(&self, kind: ConfigResourceKind, id: &str) -> anyhow::Result<()> {
 		self.delete_scoped(kind, id, &global_scopes()).await
 	}
 
-	/// Deletes the row addressed by `(kind, id, scopes)`.
 	pub async fn delete_scoped(
 		&self,
 		kind: ConfigResourceKind,
@@ -462,18 +419,19 @@ impl ConfigResourceStore {
 		scopes: &[String],
 	) -> anyhow::Result<()> {
 		validate_id(id)?;
-		let scopes = canonical_scopes(scopes.iter().cloned())?;
-		let hook = self.write_hook.as_deref();
 		let deleted = match &self.pool {
-			DatabasePool::Sqlite(pool) => delete_sqlite(pool, kind, id, &scopes, hook).await?,
+			DatabasePool::Sqlite(pool) => delete_sqlite(pool, kind, id, scopes).await?,
 			DatabasePool::Postgres(pool) => {
 				delete_postgres(
 					pool,
 					kind,
 					id,
-					&scopes,
-					self.postgres_notification_id(),
-					hook,
+					scopes,
+					self
+						.notification_id
+						.as_deref()
+						.expect("postgres store has a notification ID"),
+					self.write_hook.as_deref(),
 				)
 				.await?
 			},
@@ -483,68 +441,32 @@ impl ConfigResourceStore {
 				ConfigResourceError::NotFound(format!("config resource not found: {kind}/{id}")).into(),
 			);
 		}
-		self.notify_changed(&scopes);
+		self.notify_changed(scopes);
 		Ok(())
 	}
 
-	fn postgres_notification_id(&self) -> &str {
-		self
-			.notification_id
-			.as_deref()
-			.expect("postgres store has a notification ID")
-	}
-
-	/// Wakes local subscribers when a write touched a visible scope.
-	fn notify_changed(&self, changed_scopes: &[String]) {
-		if scopes_overlap(changed_scopes, &self.visible_scopes.load()) {
+	fn notify_changed(&self, scopes: &[String]) {
+		if scopes_overlap(scopes, &self.visible_scopes.load()) {
 			let _ = self.change_tx.send(());
 		}
 	}
 }
 
-/// Payload of the `agentgateway_config_changed` notification.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ConfigChangeNotification {
-	/// Notification ID of the process that made the change.
-	origin: String,
-	/// Union of the changed rows' scopes before and after the write.
-	#[serde(default)]
-	scopes: Option<Vec<String>>,
-}
-
-/// Decides whether a change notification should reload this process's config. Payloads that are
-/// not JSON are treated as a bare origin ID with unknown scopes.
-fn notification_requires_reload(payload: &str, self_id: &str, visible: &[String]) -> bool {
-	match serde_json::from_str::<ConfigChangeNotification>(payload) {
-		Ok(notification) => {
-			notification.origin != self_id
-				&& notification
-					.scopes
-					.as_deref()
-					.is_none_or(|scopes| scopes_overlap(scopes, visible))
-		},
+/// Whether a change notification from another process touched a visible scope. Payloads that are
+/// not JSON are a bare origin ID with unknown scopes.
+fn requires_reload(payload: &str, self_id: &str, visible: &[String]) -> bool {
+	#[derive(Deserialize)]
+	struct Notification {
+		origin: String,
+		scopes: Vec<String>,
+	}
+	match serde_json::from_str::<Notification>(payload) {
+		Ok(n) => n.origin != self_id && scopes_overlap(&n.scopes, visible),
 		Err(_) => payload != self_id,
 	}
 }
 
-async fn migrate_sqlite(pool: &SqlitePool) -> anyhow::Result<()> {
-	let mut migrator = sqlx::migrate!("./src/config_store/sqlite_migrations");
-	migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
-	migrator
-		.run(pool)
-		.await
-		.map_err(|err| anyhow::anyhow!("failed to migrate config resource database schema: {err}"))
-}
-
-async fn migrate_postgres(pool: &PgPool) -> anyhow::Result<()> {
-	let mut migrator = sqlx::migrate!("./src/config_store/postgres_migrations");
-	// Keep config migrations independent from other SQLx-managed schemas in this database.
-	migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
-	migrator
-		.run(pool)
-		.await
-		.map_err(|err| anyhow::anyhow!("failed to migrate config resource database schema: {err}"))
-}
+const MIGRATIONS_TABLE: &str = "_agentgateway_config_migrations";
 
 fn validate_id(id: &str) -> anyhow::Result<()> {
 	if id.is_empty() {
@@ -560,10 +482,8 @@ pub(crate) struct PreparedResource {
 	pub kind: ConfigResourceKind,
 	pub id: String,
 	pub value: Value,
-	/// Canonical scopes of the row after the write. Defaults to `["global"]`.
 	pub scopes: Vec<String>,
-	/// Scopes of the existing row this write replaces. When set and different from `scopes`,
-	/// the existing row is moved to `scopes` in place. `None` addresses the row at `scopes`.
+	/// Scopes of an existing row to move to `scopes`.
 	pub previous_scopes: Option<Vec<String>>,
 }
 
@@ -576,29 +496,6 @@ impl PreparedResource {
 			scopes: global_scopes(),
 			previous_scopes: None,
 		}
-	}
-
-	/// Sets the target scopes (canonicalized).
-	// Extension point for scope-aware writers; the built-in management API writes global rows.
-	#[cfg_attr(not(test), allow(dead_code))]
-	pub(crate) fn with_scopes<I, S>(mut self, scopes: I) -> anyhow::Result<Self>
-	where
-		I: IntoIterator<Item = S>,
-		S: Into<String>,
-	{
-		self.scopes = canonical_scopes(scopes)?;
-		Ok(self)
-	}
-
-	/// Addresses an existing row by its current scopes, moving it to `scopes` if they differ.
-	#[cfg_attr(not(test), allow(dead_code))]
-	pub(crate) fn with_previous_scopes<I, S>(mut self, scopes: I) -> anyhow::Result<Self>
-	where
-		I: IntoIterator<Item = S>,
-		S: Into<String>,
-	{
-		self.previous_scopes = Some(canonical_scopes(scopes)?);
-		Ok(self)
 	}
 
 	/// Scopes of the row this write addresses.
@@ -619,8 +516,7 @@ const API_KEY_METADATA_PREFIX: &str = "agentgateway.dev/";
 const API_KEY_ID_METADATA: &str = "agentgateway.dev/id";
 const API_KEY_CREATED_AT_METADATA: &str = "agentgateway.dev/createdAt";
 const API_KEY_HINT_METADATA: &str = "agentgateway.dev/keyHint";
-/// Scopes of the database row that defines an API key, injected during materialization for
-/// non-global rows. Read by API key compilation to scope budget counters.
+/// Scopes of the row that defines an API key, set on keys from non-global rows.
 pub(crate) const API_KEY_SCOPES_METADATA: &str = "agentgateway.dev/scopes";
 
 /// Older file keys have no stored ID, so expose their array position to the resource API.
@@ -1495,20 +1391,9 @@ fn append_api_keys(
 
 	for resource in db_resources {
 		let mut value = resource.value.clone();
-		// Budgets of keys scoped to specific gateways get their own counters. Global keys stay
-		// untouched so their counter IDs are unchanged.
-		if !is_global_scopes(&resource.scopes)
-			&& let Some(object) = value.as_object_mut()
-		{
-			let metadata = object
-				.entry("metadata")
-				.or_insert_with(|| Value::Object(serde_json::Map::new()));
-			if let Some(metadata) = metadata.as_object_mut() {
-				metadata.insert(
-					API_KEY_SCOPES_METADATA.to_string(),
-					Value::from(resource.scopes.clone()),
-				);
-			}
+		// Keys from scoped rows get budget counters of their own.
+		if !is_global_scopes(&resource.scopes) {
+			value["metadata"][API_KEY_SCOPES_METADATA] = Value::from(resource.scopes.clone());
 		}
 		keys.push(value);
 	}
@@ -1810,45 +1695,32 @@ fn string_field(
 		.ok_or_else(|| ConfigResourceError::InvalidRequest(error()).into())
 }
 
-const SELECT_RESOURCES: &str = "SELECT kind, id, scopes, value_json, revision, created_at, updated_at \
-	 FROM agw_config_resources";
+const SELECT_RESOURCES: &str =
+	"SELECT kind, id, scopes, value_json, revision, created_at, updated_at FROM agw_config_resources";
 
-fn sqlite_scopes(scopes: &[String]) -> anyhow::Result<String> {
-	Ok(serde_json::to_string(scopes)?)
+fn sqlite_scopes(scopes: &[String]) -> String {
+	serde_json::to_string(scopes).expect("strings serialize")
 }
 
-/// Collects the union of changed scopes, kept sorted and de-duplicated.
-fn add_changed_scopes(changed: &mut Vec<String>, scopes: &[String]) {
-	changed.extend(scopes.iter().cloned());
-	changed.sort();
-	changed.dedup();
-}
-
+/// Runs the write hook, if any, inside a Postgres write transaction.
 async fn run_write_hook(
 	hook: Option<&dyn ConfigWriteHook>,
-	conn: ConfigWriteConnection<'_>,
-	write: ConfigWrite,
+	tx: &mut Transaction<'_, Postgres>,
+	kind: ConfigResourceKind,
+	id: &str,
+	previous_scopes: Option<&[String]>,
+	scopes: Option<&[String]>,
 ) -> anyhow::Result<()> {
-	match hook {
-		Some(hook) => hook.before_write(conn, &write).await,
-		None => Ok(()),
-	}
-}
-
-fn scope_moved_conflict(kind: ConfigResourceKind, id: &str, scopes: &[String]) -> anyhow::Error {
-	ConfigResourceError::Conflict(format!(
-		"config resource already exists: {kind}/{id} in scopes [{}]",
-		scopes.join(", ")
-	))
-	.into()
-}
-
-fn scoped_not_found(kind: ConfigResourceKind, id: &str, scopes: &[String]) -> anyhow::Error {
-	ConfigResourceError::NotFound(format!(
-		"config resource not found: {kind}/{id} in scopes [{}]",
-		scopes.join(", ")
-	))
-	.into()
+	let Some(hook) = hook else {
+		return Ok(());
+	};
+	let write = ConfigWrite {
+		kind,
+		id: id.to_string(),
+		previous_scopes: previous_scopes.map(<[String]>::to_vec),
+		scopes: scopes.map(<[String]>::to_vec),
+	};
+	hook.before_write(tx, &write).await
 }
 
 async fn list_sqlite(
@@ -1863,10 +1735,9 @@ async fn list_sqlite(
 	}
 	if let Some(scopes) = scopes {
 		qb.push(
-			" AND EXISTS (SELECT 1 FROM json_each(agw_config_resources.scopes) AS row_scope \
-			 WHERE row_scope.value IN (SELECT value FROM json_each(",
+			" AND EXISTS (SELECT 1 FROM json_each(scopes) WHERE value IN (SELECT value FROM json_each(",
 		)
-		.push_bind(sqlite_scopes(scopes)?)
+		.push_bind(sqlite_scopes(scopes))
 		.push(")))");
 	}
 	qb.push(" ORDER BY kind, id, scopes");
@@ -1885,111 +1756,50 @@ async fn list_postgres(
 		qb.push(" AND kind = ").push_bind(kind.as_str());
 	}
 	if let Some(scopes) = scopes {
-		qb.push(" AND scopes && ")
-			.push_bind(scopes.to_vec())
-			.push("::TEXT[]");
+		qb.push(" AND scopes && ").push_bind(scopes.to_vec());
 	}
 	qb.push(" ORDER BY kind, id, scopes");
 	let rows = qb.build().fetch_all(pool).await?;
 	rows.into_iter().map(postgres_row_to_resource).collect()
 }
 
-async fn sqlite_row_is_live(
-	tx: &mut Transaction<'_, Sqlite>,
-	kind: ConfigResourceKind,
-	id: &str,
-	scopes: &[String],
-) -> anyhow::Result<bool> {
-	Ok(
-		sqlx::query(
-			"SELECT 1 FROM agw_config_resources \
-			 WHERE kind = ? AND id = ? AND scopes = ? AND deleted_at IS NULL",
-		)
-		.bind(kind.as_str())
-		.bind(id)
-		.bind(sqlite_scopes(scopes)?)
-		.fetch_optional(&mut **tx)
-		.await?
-		.is_some(),
-	)
-}
-
-async fn postgres_row_is_live(
-	tx: &mut Transaction<'_, Postgres>,
-	kind: ConfigResourceKind,
-	id: &str,
-	scopes: &[String],
-) -> anyhow::Result<bool> {
-	Ok(
-		sqlx::query(
-			"SELECT 1 FROM agw_config_resources \
-			 WHERE kind = $1 AND id = $2 AND scopes = $3 AND deleted_at IS NULL \
-			 FOR UPDATE",
-		)
-		.bind(kind.as_str())
-		.bind(id)
-		.bind(scopes.to_vec())
-		.fetch_optional(&mut **tx)
-		.await?
-		.is_some(),
-	)
-}
-
 async fn upsert_sqlite(
 	pool: &SqlitePool,
 	prepared: Vec<PreparedResource>,
-	hook: Option<&dyn ConfigWriteHook>,
 ) -> anyhow::Result<(Vec<ConfigResource>, Vec<String>)> {
 	let mut tx = pool.begin().await?;
+	let mut changed = Vec::with_capacity(prepared.len());
 	let mut changed_scopes = Vec::new();
-	let mut resources = Vec::with_capacity(prepared.len());
 	for resource in prepared {
-		validate_id(&resource.id)?;
-		let kind = resource.kind;
 		let target = resource.target_scopes().to_vec();
 		let now = Utc::now().to_rfc3339();
-		let previous_live = sqlite_row_is_live(&mut tx, kind, &resource.id, &target).await?;
-		run_write_hook(
-			hook,
-			ConfigWriteConnection::Sqlite(&mut tx),
-			ConfigWrite {
-				kind,
-				id: resource.id.clone(),
-				previous_scopes: previous_live.then(|| target.clone()),
-				scopes: Some(resource.scopes.clone()),
-			},
-		)
-		.await?;
 		if target != resource.scopes {
-			if !previous_live {
-				return Err(scoped_not_found(kind, &resource.id, &target));
-			}
-			if sqlite_row_is_live(&mut tx, kind, &resource.id, &resource.scopes).await? {
-				return Err(scope_moved_conflict(kind, &resource.id, &resource.scopes));
-			}
-			// A deleted row may still hold the destination key.
+			// Move the row to its new scopes in place, replacing a deleted row holding that key.
 			sqlx::query(
 				"DELETE FROM agw_config_resources \
 				 WHERE kind = ? AND id = ? AND scopes = ? AND deleted_at IS NOT NULL",
 			)
-			.bind(kind.as_str())
+			.bind(resource.kind.as_str())
 			.bind(&resource.id)
-			.bind(sqlite_scopes(&resource.scopes)?)
+			.bind(sqlite_scopes(&resource.scopes))
 			.execute(&mut *tx)
 			.await?;
-			sqlx::query(
-				"UPDATE agw_config_resources \
-				 SET scopes = ?, value_json = ?, revision = revision + 1, updated_at = ?, deleted_at = NULL \
+			let moved = sqlx::query(
+				"UPDATE agw_config_resources SET scopes = ?, value_json = ?, \
+				 revision = revision + 1, updated_at = ? \
 				 WHERE kind = ? AND id = ? AND scopes = ? AND deleted_at IS NULL",
 			)
-			.bind(sqlite_scopes(&resource.scopes)?)
+			.bind(sqlite_scopes(&resource.scopes))
 			.bind(serde_json::to_string(&resource.value)?)
 			.bind(&now)
-			.bind(kind.as_str())
+			.bind(resource.kind.as_str())
 			.bind(&resource.id)
-			.bind(sqlite_scopes(&target)?)
+			.bind(sqlite_scopes(&target))
 			.execute(&mut *tx)
 			.await?;
+			if moved.rows_affected() == 0 {
+				return Err(not_found(resource.kind, &resource.id));
+			}
 		} else {
 			sqlx::query(
 				"INSERT INTO agw_config_resources \
@@ -2001,25 +1811,30 @@ async fn upsert_sqlite(
 					updated_at = excluded.updated_at, \
 					deleted_at = NULL",
 			)
-			.bind(kind.as_str())
+			.bind(resource.kind.as_str())
 			.bind(&resource.id)
-			.bind(sqlite_scopes(&resource.scopes)?)
+			.bind(sqlite_scopes(&resource.scopes))
 			.bind(serde_json::to_string(&resource.value)?)
 			.bind(&now)
 			.bind(&now)
 			.execute(&mut *tx)
 			.await?;
 		}
-		add_changed_scopes(&mut changed_scopes, &target);
-		add_changed_scopes(&mut changed_scopes, &resource.scopes);
+		changed_scopes.extend(target);
+		changed_scopes.extend(resource.scopes.iter().cloned());
+		changed.push(resource);
+	}
+
+	let mut resources = Vec::with_capacity(changed.len());
+	for resource in changed {
 		if let Some(resource) =
-			fetch_sqlite_resource(&mut tx, kind, &resource.id, &resource.scopes).await?
+			fetch_sqlite_resource(&mut tx, resource.kind, &resource.id, &resource.scopes).await?
 		{
 			resources.push(resource);
 		}
 	}
 	tx.commit().await?;
-	Ok((resources, changed_scopes))
+	Ok((resources, canonical_scopes(changed_scopes)))
 }
 
 async fn upsert_postgres(
@@ -2029,55 +1844,47 @@ async fn upsert_postgres(
 	hook: Option<&dyn ConfigWriteHook>,
 ) -> anyhow::Result<(Vec<ConfigResource>, Vec<String>)> {
 	let mut tx = pool.begin().await?;
+	let mut changed = Vec::with_capacity(prepared.len());
 	let mut changed_scopes = Vec::new();
-	let mut resources = Vec::with_capacity(prepared.len());
 	for resource in prepared {
-		validate_id(&resource.id)?;
-		let kind = resource.kind;
 		let target = resource.target_scopes().to_vec();
 		let now = Utc::now();
-		let previous_live = postgres_row_is_live(&mut tx, kind, &resource.id, &target).await?;
 		run_write_hook(
 			hook,
-			ConfigWriteConnection::Postgres(&mut tx),
-			ConfigWrite {
-				kind,
-				id: resource.id.clone(),
-				previous_scopes: previous_live.then(|| target.clone()),
-				scopes: Some(resource.scopes.clone()),
-			},
+			&mut tx,
+			resource.kind,
+			&resource.id,
+			Some(&target),
+			Some(&resource.scopes),
 		)
 		.await?;
 		if target != resource.scopes {
-			if !previous_live {
-				return Err(scoped_not_found(kind, &resource.id, &target));
-			}
-			if postgres_row_is_live(&mut tx, kind, &resource.id, &resource.scopes).await? {
-				return Err(scope_moved_conflict(kind, &resource.id, &resource.scopes));
-			}
-			// A deleted row may still hold the destination key.
+			// Move the row to its new scopes in place, replacing a deleted row holding that key.
 			sqlx::query(
 				"DELETE FROM agw_config_resources \
 				 WHERE kind = $1 AND id = $2 AND scopes = $3 AND deleted_at IS NOT NULL",
 			)
-			.bind(kind.as_str())
+			.bind(resource.kind.as_str())
 			.bind(&resource.id)
-			.bind(resource.scopes.clone())
+			.bind(&resource.scopes)
 			.execute(&mut *tx)
 			.await?;
-			sqlx::query(
-				"UPDATE agw_config_resources \
-				 SET scopes = $1, value_json = $2, revision = revision + 1, updated_at = $3, deleted_at = NULL \
+			let moved = sqlx::query(
+				"UPDATE agw_config_resources SET scopes = $1, value_json = $2, \
+				 revision = revision + 1, updated_at = $3 \
 				 WHERE kind = $4 AND id = $5 AND scopes = $6 AND deleted_at IS NULL",
 			)
-			.bind(resource.scopes.clone())
+			.bind(&resource.scopes)
 			.bind(Json(&resource.value))
 			.bind(now)
-			.bind(kind.as_str())
+			.bind(resource.kind.as_str())
 			.bind(&resource.id)
-			.bind(target.clone())
+			.bind(&target)
 			.execute(&mut *tx)
 			.await?;
+			if moved.rows_affected() == 0 {
+				return Err(not_found(resource.kind, &resource.id));
+			}
 		} else {
 			sqlx::query(
 				"INSERT INTO agw_config_resources \
@@ -2089,22 +1896,28 @@ async fn upsert_postgres(
 					updated_at = excluded.updated_at, \
 					deleted_at = NULL",
 			)
-			.bind(kind.as_str())
+			.bind(resource.kind.as_str())
 			.bind(&resource.id)
-			.bind(resource.scopes.clone())
+			.bind(&resource.scopes)
 			.bind(Json(&resource.value))
 			.bind(now)
 			.execute(&mut *tx)
 			.await?;
 		}
-		add_changed_scopes(&mut changed_scopes, &target);
-		add_changed_scopes(&mut changed_scopes, &resource.scopes);
+		changed_scopes.extend(target);
+		changed_scopes.extend(resource.scopes.iter().cloned());
+		changed.push(resource);
+	}
+
+	let mut resources = Vec::with_capacity(changed.len());
+	for resource in changed {
 		if let Some(resource) =
-			fetch_postgres_resource(&mut tx, kind, &resource.id, &resource.scopes).await?
+			fetch_postgres_resource(&mut tx, resource.kind, &resource.id, &resource.scopes).await?
 		{
 			resources.push(resource);
 		}
 	}
+	let changed_scopes = canonical_scopes(changed_scopes);
 	if !resources.is_empty() {
 		notify_postgres(&mut tx, notification_id, &changed_scopes).await?;
 	}
@@ -2112,18 +1925,8 @@ async fn upsert_postgres(
 	Ok((resources, changed_scopes))
 }
 
-fn validate_rename(
-	previous_kind: ConfigResourceKind,
-	previous_id: &str,
-	prepared: &PreparedResource,
-) -> anyhow::Result<()> {
-	if previous_kind != prepared.kind || previous_id == prepared.id {
-		return Err(
-			ConfigResourceError::InvalidRequest("config resource rename requires a new ID".to_string())
-				.into(),
-		);
-	}
-	Ok(())
+fn not_found(kind: ConfigResourceKind, id: &str) -> anyhow::Error {
+	ConfigResourceError::NotFound(format!("config resource not found: {kind}/{id}")).into()
 }
 
 async fn rename_sqlite(
@@ -2131,34 +1934,16 @@ async fn rename_sqlite(
 	previous_kind: ConfigResourceKind,
 	previous_id: &str,
 	prepared: PreparedResource,
-	hook: Option<&dyn ConfigWriteHook>,
-) -> anyhow::Result<(ConfigResource, Vec<String>)> {
-	validate_rename(previous_kind, previous_id, &prepared)?;
+) -> anyhow::Result<ConfigResource> {
+	if previous_kind != prepared.kind || previous_id == prepared.id {
+		return Err(
+			ConfigResourceError::InvalidRequest("config resource rename requires a new ID".to_string())
+				.into(),
+		);
+	}
 	let target = prepared.target_scopes().to_vec();
 	let mut tx = pool.begin().await?;
 	let now = Utc::now().to_rfc3339();
-	run_write_hook(
-		hook,
-		ConfigWriteConnection::Sqlite(&mut tx),
-		ConfigWrite {
-			kind: previous_kind,
-			id: previous_id.to_string(),
-			previous_scopes: Some(target.clone()),
-			scopes: None,
-		},
-	)
-	.await?;
-	run_write_hook(
-		hook,
-		ConfigWriteConnection::Sqlite(&mut tx),
-		ConfigWrite {
-			kind: prepared.kind,
-			id: prepared.id.clone(),
-			previous_scopes: None,
-			scopes: Some(prepared.scopes.clone()),
-		},
-	)
-	.await?;
 	if !soft_delete_sqlite(&mut tx, previous_kind, previous_id, &target, &now).await? {
 		return Err(
 			ConfigResourceError::NotFound(format!(
@@ -2181,7 +1966,7 @@ async fn rename_sqlite(
 	)
 	.bind(prepared.kind.as_str())
 	.bind(&prepared.id)
-	.bind(sqlite_scopes(&prepared.scopes)?)
+	.bind(sqlite_scopes(&prepared.scopes))
 	.bind(serde_json::to_string(&prepared.value)?)
 	.bind(&now)
 	.bind(&now)
@@ -2200,10 +1985,7 @@ async fn rename_sqlite(
 		.await?
 		.ok_or_else(|| anyhow::anyhow!("renamed config resource was not found"))?;
 	tx.commit().await?;
-	let mut changed_scopes = Vec::new();
-	add_changed_scopes(&mut changed_scopes, &target);
-	add_changed_scopes(&mut changed_scopes, &prepared.scopes);
-	Ok((resource, changed_scopes))
+	Ok(resource)
 }
 
 async fn rename_postgres(
@@ -2213,31 +1995,32 @@ async fn rename_postgres(
 	prepared: PreparedResource,
 	notification_id: &str,
 	hook: Option<&dyn ConfigWriteHook>,
-) -> anyhow::Result<(ConfigResource, Vec<String>)> {
-	validate_rename(previous_kind, previous_id, &prepared)?;
+) -> anyhow::Result<ConfigResource> {
+	if previous_kind != prepared.kind || previous_id == prepared.id {
+		return Err(
+			ConfigResourceError::InvalidRequest("config resource rename requires a new ID".to_string())
+				.into(),
+		);
+	}
 	let target = prepared.target_scopes().to_vec();
 	let mut tx = pool.begin().await?;
 	let now = Utc::now();
 	run_write_hook(
 		hook,
-		ConfigWriteConnection::Postgres(&mut tx),
-		ConfigWrite {
-			kind: previous_kind,
-			id: previous_id.to_string(),
-			previous_scopes: Some(target.clone()),
-			scopes: None,
-		},
+		&mut tx,
+		previous_kind,
+		previous_id,
+		Some(&target),
+		None,
 	)
 	.await?;
 	run_write_hook(
 		hook,
-		ConfigWriteConnection::Postgres(&mut tx),
-		ConfigWrite {
-			kind: prepared.kind,
-			id: prepared.id.clone(),
-			previous_scopes: None,
-			scopes: Some(prepared.scopes.clone()),
-		},
+		&mut tx,
+		prepared.kind,
+		&prepared.id,
+		None,
+		Some(&prepared.scopes),
 	)
 	.await?;
 	if !soft_delete_postgres(&mut tx, previous_kind, previous_id, &target, now).await? {
@@ -2262,7 +2045,7 @@ async fn rename_postgres(
 	)
 	.bind(prepared.kind.as_str())
 	.bind(&prepared.id)
-	.bind(prepared.scopes.clone())
+	.bind(&prepared.scopes)
 	.bind(Json(&prepared.value))
 	.bind(now)
 	.execute(&mut *tx)
@@ -2279,12 +2062,14 @@ async fn rename_postgres(
 	let resource = fetch_postgres_resource(&mut tx, prepared.kind, &prepared.id, &prepared.scopes)
 		.await?
 		.ok_or_else(|| anyhow::anyhow!("renamed config resource was not found"))?;
-	let mut changed_scopes = Vec::new();
-	add_changed_scopes(&mut changed_scopes, &target);
-	add_changed_scopes(&mut changed_scopes, &prepared.scopes);
-	notify_postgres(&mut tx, notification_id, &changed_scopes).await?;
+	notify_postgres(
+		&mut tx,
+		notification_id,
+		&canonical_scopes([target, prepared.scopes].concat()),
+	)
+	.await?;
 	tx.commit().await?;
-	Ok((resource, changed_scopes))
+	Ok(resource)
 }
 
 async fn delete_sqlite(
@@ -2292,21 +2077,9 @@ async fn delete_sqlite(
 	kind: ConfigResourceKind,
 	id: &str,
 	scopes: &[String],
-	hook: Option<&dyn ConfigWriteHook>,
 ) -> anyhow::Result<bool> {
 	let mut tx = pool.begin().await?;
 	let now = Utc::now().to_rfc3339();
-	run_write_hook(
-		hook,
-		ConfigWriteConnection::Sqlite(&mut tx),
-		ConfigWrite {
-			kind,
-			id: id.to_string(),
-			previous_scopes: Some(scopes.to_vec()),
-			scopes: None,
-		},
-	)
-	.await?;
 	let deleted = soft_delete_sqlite(&mut tx, kind, id, scopes, &now).await?;
 	tx.commit().await?;
 	Ok(deleted)
@@ -2328,7 +2101,7 @@ async fn soft_delete_sqlite(
 	.bind(now)
 	.bind(kind.as_str())
 	.bind(id)
-	.bind(sqlite_scopes(scopes)?)
+	.bind(sqlite_scopes(scopes))
 	.execute(&mut **tx)
 	.await?;
 	Ok(result.rows_affected() > 0)
@@ -2344,17 +2117,7 @@ async fn delete_postgres(
 ) -> anyhow::Result<bool> {
 	let mut tx = pool.begin().await?;
 	let now = Utc::now();
-	run_write_hook(
-		hook,
-		ConfigWriteConnection::Postgres(&mut tx),
-		ConfigWrite {
-			kind,
-			id: id.to_string(),
-			previous_scopes: Some(scopes.to_vec()),
-			scopes: None,
-		},
-	)
-	.await?;
+	run_write_hook(hook, &mut tx, kind, id, Some(scopes), None).await?;
 	let deleted = soft_delete_postgres(&mut tx, kind, id, scopes, now).await?;
 	if deleted {
 		notify_postgres(&mut tx, notification_id, scopes).await?;
@@ -2378,17 +2141,10 @@ async fn soft_delete_postgres(
 	.bind(now)
 	.bind(kind.as_str())
 	.bind(id)
-	.bind(scopes.to_vec())
+	.bind(scopes)
 	.execute(&mut **tx)
 	.await?;
 	Ok(result.rows_affected() > 0)
-}
-
-fn notification_payload(notification_id: &str, scopes: &[String]) -> anyhow::Result<String> {
-	Ok(serde_json::to_string(&ConfigChangeNotification {
-		origin: notification_id.to_string(),
-		scopes: Some(scopes.to_vec()),
-	})?)
 }
 
 async fn notify_postgres(
@@ -2396,9 +2152,10 @@ async fn notify_postgres(
 	notification_id: &str,
 	scopes: &[String],
 ) -> anyhow::Result<()> {
+	let payload = serde_json::json!({ "origin": notification_id, "scopes": scopes });
 	sqlx::query("SELECT pg_notify($1, $2)")
 		.bind(POSTGRES_CHANGE_CHANNEL)
-		.bind(notification_payload(notification_id, scopes)?)
+		.bind(payload.to_string())
 		.execute(&mut **tx)
 		.await?;
 	Ok(())
@@ -2417,7 +2174,7 @@ async fn fetch_sqlite_resource(
 	)
 	.bind(kind.as_str())
 	.bind(id)
-	.bind(sqlite_scopes(scopes)?)
+	.bind(sqlite_scopes(scopes))
 	.fetch_optional(&mut **tx)
 	.await?
 	.map(sqlite_row_to_resource)
@@ -2627,455 +2384,105 @@ mod tests {
 		);
 	}
 
-	fn provider(id: &str) -> PreparedResource {
-		PreparedResource::new(
+	fn provider(id: &str, scopes: &[&str]) -> PreparedResource {
+		let mut resource = PreparedResource::new(
 			ConfigResourceKind::LlmProvider,
 			id.to_string(),
 			json!({"name": id, "provider": "openAI"}),
-		)
+		);
+		resource.scopes = canonical_scopes(scopes.iter().copied());
+		resource
 	}
 
-	fn scopes(scopes: &[&str]) -> Vec<String> {
-		scopes.iter().map(ToString::to_string).collect()
-	}
-
-	async fn sqlite_store() -> ConfigResourceStore {
-		ConfigResourceStore::connect("sqlite::memory:", None)
-			.await
-			.expect("connect config resource store")
-	}
-
-	fn ids_and_scopes(resources: &[ConfigResource]) -> Vec<(String, Vec<String>)> {
+	fn ids_and_scopes(resources: &[ConfigResource]) -> Vec<(&str, Vec<&str>)> {
 		resources
 			.iter()
-			.map(|resource| (resource.id.clone(), resource.scopes.clone()))
+			.map(|r| (r.id.as_str(), r.scopes.iter().map(String::as_str).collect()))
 			.collect()
 	}
 
-	#[test]
-	fn canonicalizes_scopes() {
-		assert_eq!(
-			canonical_scopes(Vec::<String>::new()).unwrap(),
-			scopes(&["global"])
-		);
-		assert_eq!(
-			canonical_scopes(["gateway:b", "gateway:a", "gateway:b"]).unwrap(),
-			scopes(&["gateway:a", "gateway:b"])
-		);
-		for invalid in ["", "a,b", "a b", "a\n"] {
-			assert!(canonical_scopes([invalid]).is_err(), "{invalid:?}");
-		}
-		assert!(is_global_scopes(&[]));
-		assert!(is_global_scopes(&scopes(&["global"])));
-		assert!(!is_global_scopes(&scopes(&["gateway:a"])));
-		assert!(scopes_overlap(
-			&scopes(&["gateway:a", "global"]),
-			&scopes(&["global"])
-		));
-		assert!(!scopes_overlap(
-			&scopes(&["gateway:a"]),
-			&scopes(&["global"])
-		));
-	}
-
 	#[tokio::test]
-	async fn migrates_existing_pre_scopes_sqlite_database() {
-		let pool = DatabasePool::connect("sqlite::memory:")
-			.await
-			.expect("connect sqlite");
+	async fn migrates_legacy_rows_to_global_scope() {
+		let pool = DatabasePool::connect("sqlite::memory:").await.unwrap();
 		let DatabasePool::Sqlite(sqlite) = &pool else {
 			unreachable!()
 		};
-		// Schema and data as written by releases before numbered migrations.
-		sqlx::raw_sql(
-			r#"
-CREATE TABLE IF NOT EXISTS agw_config_resources (
-	kind TEXT NOT NULL,
-	id TEXT NOT NULL,
-	value_json TEXT NOT NULL CHECK (json_valid(value_json)),
-	revision INTEGER NOT NULL DEFAULT 1,
-	created_at TEXT NOT NULL,
-	updated_at TEXT NOT NULL,
-	deleted_at TEXT,
-	PRIMARY KEY (kind, id)
-);
-CREATE INDEX IF NOT EXISTS idx_agw_config_resources_kind_updated
-	ON agw_config_resources(kind, updated_at);
-INSERT INTO agw_config_resources (kind, id, value_json, revision, created_at, updated_at)
-VALUES ('llm.provider', 'legacy', '{"name":"legacy","provider":"openAI"}', 3,
-	'2026-01-01T00:00:00+00:00', '2026-01-02T00:00:00+00:00');
-"#,
+		sqlx::raw_sql(include_str!(
+			"config_store/sqlite_migrations/0001_create_config_resources.sql"
+		))
+		.execute(sqlite)
+		.await
+		.unwrap();
+		sqlx::query(
+			"INSERT INTO agw_config_resources (kind, id, value_json, created_at, updated_at) \
+			 VALUES ('llm.provider', 'legacy', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
 		)
 		.execute(sqlite)
 		.await
-		.expect("create legacy schema");
-
-		let store = ConfigResourceStore::from_pool(pool.clone())
-			.await
-			.expect("migrate legacy database");
-		let resources = store.list(None).await.expect("list");
-		assert_eq!(
-			ids_and_scopes(&resources),
-			vec![("legacy".to_string(), scopes(&["global"]))]
-		);
-		assert_eq!(resources[0].revision, 3);
-
-		// Migrations are recorded, so a second start is a no-op.
-		let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _agentgateway_config_migrations")
-			.fetch_one(sqlite)
-			.await
-			.expect("count migrations");
-		assert_eq!(applied, 2);
-		let store = ConfigResourceStore::from_pool(pool)
-			.await
-			.expect("restart on migrated database");
-		assert_eq!(store.list(None).await.expect("list").len(), 1);
-
-		// The same id can now exist in another scope.
-		store
-			.upsert_prepared(vec![
-				provider("legacy")
-					.with_scopes(["gateway:a"])
-					.expect("scopes"),
-			])
-			.await
-			.expect("insert scoped row");
-		assert_eq!(
-			store
-				.list_scoped(None, ScopeFilter::All)
-				.await
-				.expect("list all")
-				.len(),
-			2
-		);
+		.unwrap();
+		let store = ConfigResourceStore::from_pool(pool).await.unwrap();
+		let rows = store.list(None).await.unwrap();
+		assert_eq!(ids_and_scopes(&rows), vec![("legacy", vec!["global"])]);
 	}
 
 	#[tokio::test]
-	async fn filters_rows_by_visible_scopes() {
-		let store = sqlite_store().await;
+	async fn scopes_filter_rows_and_move_in_place() {
+		let store = ConfigResourceStore::connect("sqlite::memory:", None)
+			.await
+			.unwrap();
 		store
 			.upsert_prepared(vec![
-				provider("shared"),
-				provider("shared")
-					.with_scopes(["gateway:a"])
-					.expect("scopes"),
-				provider("b-only")
-					.with_scopes(["gateway:b", "gateway:b"])
-					.expect("scopes"),
+				provider("shared", &[]),
+				provider("shared", &["a"]),
+				provider("other", &["b"]),
 			])
 			.await
-			.expect("insert rows");
+			.unwrap();
+		let visible = store.list(None).await.unwrap();
+		assert_eq!(ids_and_scopes(&visible), vec![("shared", vec!["global"])]);
+		store.set_visible_scopes(["a", "global"]);
+		assert_eq!(store.list(None).await.unwrap().len(), 2);
 
-		assert_eq!(store.visible_scopes(), scopes(&["global"]));
+		let mut moved = provider("other", &["a", "b"]);
+		moved.previous_scopes = Some(vec!["b".into()]);
+		let moved = store.upsert_prepared(vec![moved]).await.unwrap().resources;
+		assert_eq!(moved[0].revision, 2);
+		let all = store.list_scoped(None, ScopeFilter::All).await.unwrap();
 		assert_eq!(
-			ids_and_scopes(&store.list(None).await.expect("list")),
-			vec![("shared".to_string(), scopes(&["global"]))]
-		);
-
-		store
-			.set_visible_scopes(["gateway:a", "global"])
-			.expect("set visible scopes");
-		assert_eq!(
-			ids_and_scopes(&store.list(None).await.expect("list")),
+			ids_and_scopes(&all),
 			vec![
-				("shared".to_string(), scopes(&["gateway:a"])),
-				("shared".to_string(), scopes(&["global"])),
+				("other", vec!["a", "b"]),
+				("shared", vec!["a"]),
+				("shared", vec!["global"])
 			]
 		);
-		assert_eq!(
-			ids_and_scopes(
-				&store
-					.list_scoped(None, ScopeFilter::Overlapping(scopes(&["gateway:b"])))
-					.await
-					.expect("list overlapping")
-			),
-			vec![("b-only".to_string(), scopes(&["gateway:b"]))]
-		);
-		assert_eq!(
-			store
-				.list_scoped(Some(ConfigResourceKind::LlmProvider), ScopeFilter::All)
-				.await
-				.expect("list all")
-				.len(),
-			3
-		);
-
 		store
-			.delete_scoped(
-				ConfigResourceKind::LlmProvider,
-				"shared",
-				&scopes(&["gateway:a"]),
-			)
+			.delete_scoped(ConfigResourceKind::LlmProvider, "shared", &["a".into()])
 			.await
-			.expect("delete scoped row");
-		assert_eq!(
-			ids_and_scopes(&store.list(None).await.expect("list")),
-			vec![("shared".to_string(), scopes(&["global"]))]
-		);
-	}
-
-	#[tokio::test]
-	async fn scope_changes_update_rows_in_place() {
-		let store = sqlite_store().await;
-		let created = store
-			.upsert_prepared(vec![
-				provider("moving")
-					.with_scopes(["gateway:a"])
-					.expect("scopes"),
-			])
-			.await
-			.expect("insert")
-			.resources
-			.remove(0);
-
-		let moved = store
-			.upsert_prepared(vec![
-				provider("moving")
-					.with_scopes(["gateway:b", "gateway:a"])
-					.expect("scopes")
-					.with_previous_scopes(["gateway:a"])
-					.expect("previous scopes"),
-			])
-			.await
-			.expect("move scopes")
-			.resources
-			.remove(0);
-		assert_eq!(moved.scopes, scopes(&["gateway:a", "gateway:b"]));
-		assert_eq!(moved.revision, created.revision + 1);
-		assert_eq!(moved.created_at, created.created_at);
-		assert_eq!(
-			ids_and_scopes(
-				&store
-					.list_scoped(None, ScopeFilter::All)
-					.await
-					.expect("list all")
-			),
-			vec![("moving".to_string(), scopes(&["gateway:a", "gateway:b"]))]
-		);
-
-		// Moving onto a live row with the same id fails and leaves both rows intact.
-		store
-			.upsert_prepared(vec![provider("moving")])
-			.await
-			.expect("insert global row");
-		let err = store
-			.upsert_prepared(vec![
-				provider("moving")
-					.with_previous_scopes(["gateway:a", "gateway:b"])
-					.expect("previous scopes"),
-			])
-			.await
-			.expect_err("moving onto a live row should fail");
-		assert!(matches!(
-			err.downcast_ref::<ConfigResourceError>(),
-			Some(ConfigResourceError::Conflict(_))
-		));
-		assert_eq!(
-			store
-				.list_scoped(None, ScopeFilter::All)
-				.await
-				.expect("list all")
-				.len(),
-			2
-		);
-
-		// Moving a row that does not exist is not found.
-		let err = store
-			.upsert_prepared(vec![
-				provider("missing")
-					.with_previous_scopes(["gateway:z"])
-					.expect("previous scopes"),
-			])
-			.await
-			.expect_err("missing row");
-		assert!(matches!(
-			err.downcast_ref::<ConfigResourceError>(),
-			Some(ConfigResourceError::NotFound(_))
-		));
-
-		// A deleted row at the destination key does not block a move.
-		store
-			.delete(ConfigResourceKind::LlmProvider, "moving")
-			.await
-			.expect("delete global row");
-		store
-			.upsert_prepared(vec![
-				provider("moving")
-					.with_previous_scopes(["gateway:a", "gateway:b"])
-					.expect("previous scopes"),
-			])
-			.await
-			.expect("move to global over a deleted row");
-		assert_eq!(
-			ids_and_scopes(
-				&store
-					.list_scoped(None, ScopeFilter::All)
-					.await
-					.expect("list all")
-			),
-			vec![("moving".to_string(), scopes(&["global"]))]
-		);
-	}
-
-	#[tokio::test]
-	async fn local_change_notifications_follow_visible_scopes() {
-		let store = sqlite_store().await;
-		let changes = store.subscribe_changes();
-		store
-			.upsert_prepared(vec![
-				provider("other")
-					.with_scopes(["gateway:b"])
-					.expect("scopes"),
-			])
-			.await
-			.expect("insert invisible row");
-		assert!(!changes.has_changed().expect("channel open"));
-		store
-			.upsert_prepared(vec![provider("global")])
-			.await
-			.expect("insert visible row");
-		assert!(changes.has_changed().expect("channel open"));
+			.unwrap();
+		assert_eq!(store.list(None).await.unwrap().len(), 2);
 	}
 
 	#[test]
-	fn change_notifications_are_filtered_by_scope() {
-		let visible = scopes(&["gateway:a", "global"]);
-		let payload = |origin: &str, scopes: &[&str]| {
-			notification_payload(origin, &self::scopes(scopes)).expect("payload")
-		};
-		assert_eq!(
-			serde_json::from_str::<Value>(&payload("me", &["global"])).unwrap(),
-			json!({"origin": "me", "scopes": ["global"]})
-		);
-		// Self-originated changes never reload.
-		assert!(!notification_requires_reload(
-			&payload("me", &["global"]),
+	fn reloads_follow_visible_scopes() {
+		let visible = ["global".to_string()];
+		let payload =
+			|origin: &str, scopes: &str| format!(r#"{{"origin":"{origin}","scopes":{scopes}}}"#);
+		assert!(requires_reload(
+			&payload("other", r#"["global"]"#),
 			"me",
 			&visible
 		));
-		assert!(notification_requires_reload(
-			&payload("other", &["global"]),
+		assert!(!requires_reload(
+			&payload("other", r#"["a"]"#),
 			"me",
 			&visible
 		));
-		assert!(notification_requires_reload(
-			&payload("other", &["gateway:a", "gateway:b"]),
+		assert!(!requires_reload(
+			&payload("me", r#"["global"]"#),
 			"me",
 			&visible
 		));
-		assert!(!notification_requires_reload(
-			&payload("other", &["gateway:b"]),
-			"me",
-			&visible
-		));
-		// Notifications without scopes, or in the legacy bare-ID format, always reload.
-		assert!(notification_requires_reload(
-			r#"{"origin":"other"}"#,
-			"me",
-			&visible
-		));
-		assert!(notification_requires_reload("other", "me", &visible));
-		assert!(!notification_requires_reload("me", "me", &visible));
-	}
-
-	#[derive(Debug, Default)]
-	struct RecordingHook(std::sync::Mutex<Vec<ConfigWrite>>);
-
-	#[async_trait::async_trait]
-	impl ConfigWriteHook for RecordingHook {
-		async fn before_write(
-			&self,
-			_conn: ConfigWriteConnection<'_>,
-			write: &ConfigWrite,
-		) -> anyhow::Result<()> {
-			self.0.lock().unwrap().push(write.clone());
-			if write.id == "blocked" {
-				anyhow::bail!("blocked by hook");
-			}
-			Ok(())
-		}
-	}
-
-	#[tokio::test]
-	async fn write_hook_sees_and_can_reject_writes() {
-		let hook = Arc::new(RecordingHook::default());
-		let store = sqlite_store().await.with_write_hook(hook.clone());
-		store
-			.upsert_prepared(vec![
-				provider("ok").with_scopes(["gateway:a"]).expect("scopes"),
-			])
-			.await
-			.expect("allowed write");
-		store
-			.upsert_prepared(vec![provider("blocked")])
-			.await
-			.expect_err("hook rejects write");
-		assert!(
-			store
-				.list_scoped(None, ScopeFilter::All)
-				.await
-				.expect("list")
-				.iter()
-				.all(|resource| resource.id != "blocked")
-		);
-		store
-			.delete_scoped(
-				ConfigResourceKind::LlmProvider,
-				"ok",
-				&scopes(&["gateway:a"]),
-			)
-			.await
-			.expect("delete");
-		let writes = hook.0.lock().unwrap().clone();
-		assert_eq!(
-			writes[0],
-			ConfigWrite {
-				kind: ConfigResourceKind::LlmProvider,
-				id: "ok".to_string(),
-				previous_scopes: None,
-				scopes: Some(scopes(&["gateway:a"])),
-			}
-		);
-		assert_eq!(
-			writes.last().unwrap(),
-			&ConfigWrite {
-				kind: ConfigResourceKind::LlmProvider,
-				id: "ok".to_string(),
-				previous_scopes: Some(scopes(&["gateway:a"])),
-				scopes: None,
-			}
-		);
-	}
-
-	#[test]
-	fn materialization_tags_scoped_api_keys() {
-		let base = "llm:\n  policies:\n    apiKey:\n      keys: []\n";
-		let key = |id: &str, scopes: Vec<String>| ConfigResource {
-			scopes,
-			..test_resource(
-				ConfigResourceKind::LlmApiKey,
-				id,
-				json!({"key": id, "metadata": {"name": id}}),
-			)
-		};
-		let config = materialize_config(
-			base,
-			&[
-				key("global-key", global_scopes()),
-				key("scoped-key", scopes(&["gateway:a"])),
-			],
-		)
-		.expect("materialize");
-		let config: Value = crate::yaml::from_str(&config).expect("parse");
-		let keys = config
-			.pointer("/llm/policies/apiKey/keys")
-			.and_then(Value::as_array)
-			.expect("keys");
-		assert_eq!(keys[0]["metadata"], json!({"name": "global-key"}));
-		assert_eq!(
-			keys[1]["metadata"],
-			json!({"name": "scoped-key", "agentgateway.dev/scopes": ["gateway:a"]})
-		);
 	}
 
 	#[tokio::test]

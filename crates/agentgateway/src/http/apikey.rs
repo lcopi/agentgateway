@@ -550,7 +550,11 @@ impl LocalAPIKey {
 				"budget limit exceeds database integer range"
 			);
 		}
-		let scopes = budget_scopes(&metadata)?;
+		let scopes = metadata
+			.get(crate::config_store::API_KEY_SCOPES_METADATA)
+			.and_then(|scopes| serde_json::from_value::<Vec<String>>(scopes.clone()).ok())
+			.map(crate::config_store::canonical_scopes)
+			.unwrap_or_default();
 		let budgets = (!budgets.is_empty()).then(|| MatchedBudgets {
 			api_key: api_key.expect("budget API keys have a name"),
 			api_key_id: key_hash.as_str().to_owned(),
@@ -566,21 +570,6 @@ impl LocalAPIKey {
 			},
 		))
 	}
-}
-
-/// Reads the scopes of the config row that defined this key, set during hybrid config
-/// materialization for non-global rows. Keys without it use global budget counters.
-fn budget_scopes(metadata: &UserMetadata) -> anyhow::Result<Vec<String>> {
-	let Some(scopes) = metadata.get(crate::config_store::API_KEY_SCOPES_METADATA) else {
-		return Ok(Vec::new());
-	};
-	let scopes: Vec<String> = serde_json::from_value(scopes.clone()).map_err(|err| {
-		anyhow::anyhow!(
-			"{} must be an array of strings: {err}",
-			crate::config_store::API_KEY_SCOPES_METADATA
-		)
-	})?;
-	Ok(crate::config_store::canonical_scopes(scopes)?)
 }
 
 impl LocalAPIKeys {

@@ -10,10 +10,9 @@ use tracing::{error, info, warn};
 use super::{
 	AnalyticsGroup, AnalyticsSummaryRequest, AnalyticsSummaryResponse, AnalyticsTimeBucket,
 	GenAiEntry, GetRequest, GetResponse, GroupBy, GroupByField, LogEntry, LogFilters, PayloadEntry,
-	RequestLogLabels, SearchRequest, SearchResponse, StoredRequestLog, StoredRequestLogPayload,
-	TailRequest, TailResponse, TimeRange, TurnEntry, UsageEntry, analytics_window,
-	attr_filter_values, decode_cursor, encode_cursor, limit, promoted_attribute_column,
-	prompt_preview, turn_kind,
+	SearchRequest, SearchResponse, StoredRequestLog, StoredRequestLogPayload, TailRequest,
+	TailResponse, TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values,
+	decode_cursor, encode_cursor, limit, promoted_attribute_column, prompt_preview, turn_kind,
 };
 
 pub struct PostgresLogStore {
@@ -30,18 +29,14 @@ impl PostgresLogStore {
 		Ok(Self { pool })
 	}
 
-	pub async fn insert_batch(
-		&self,
-		records: &[StoredRequestLog],
-		labels: &RequestLogLabels,
-	) -> anyhow::Result<()> {
+	pub async fn insert_batch(&self, records: &[StoredRequestLog]) -> anyhow::Result<()> {
 		if records.is_empty() {
 			return Ok(());
 		}
 		let mut tx = self.pool.begin().await?;
 		let mut logs = String::new();
 		for record in records {
-			push_request_log_copy_row(&mut logs, record, labels)?;
+			push_request_log_copy_row(&mut logs, record)?;
 		}
 		let mut copy = tx.copy_in_raw(COPY_REQUEST_LOGS).await?;
 		copy.send(logs.as_bytes()).await?;
@@ -296,11 +291,7 @@ async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
 	}
 }
 
-fn push_request_log_copy_row(
-	buf: &mut String,
-	record: &StoredRequestLog,
-	labels: &RequestLogLabels,
-) -> anyhow::Result<()> {
+fn push_request_log_copy_row(buf: &mut String, record: &StoredRequestLog) -> anyhow::Result<()> {
 	let mut first = true;
 	push_copy_text_column(buf, &mut first, Some(&record.id));
 	push_copy_text_column(buf, &mut first, Some(&record.started_at.to_rfc3339()));
@@ -323,8 +314,9 @@ fn push_request_log_copy_row(
 	push_copy_text_column(buf, &mut first, record.user_agent_name.as_deref());
 	push_copy_display_column(buf, &mut first, Some(record.has_payload));
 	push_copy_text_column(buf, &mut first, Some(record.attributes_json.as_ref()));
-	push_copy_text_column(buf, &mut first, labels.gateway.as_deref());
-	push_copy_text_column(buf, &mut first, labels.instance_id.as_deref());
+	let (gateway, instance_id) = super::request_log_labels();
+	push_copy_text_column(buf, &mut first, gateway);
+	push_copy_text_column(buf, &mut first, instance_id);
 	buf.push('\n');
 	Ok(())
 }

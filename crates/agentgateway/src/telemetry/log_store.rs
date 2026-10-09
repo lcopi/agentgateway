@@ -20,27 +20,24 @@ static REQUEST_LOG_STORE: OnceLock<RequestLogStore> = OnceLock::new();
 static REQUEST_LOG_STORE_BACKLOG: AtomicUsize = AtomicUsize::new(0);
 static REQUEST_LOG_LABELS: OnceLock<RequestLogLabels> = OnceLock::new();
 
-/// Process-wide labels stamped on every stored request log row. Unset labels are stored as NULL.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Labels stored with every request log in the `gateway` and `instance_id` columns.
+#[derive(Clone, Debug, Default)]
 pub struct RequestLogLabels {
-	/// Name of the gateway deployment that served the request (`request_logs.gateway`).
 	pub gateway: Option<String>,
-	/// ID of the process that served the request (`request_logs.instance_id`).
 	pub instance_id: Option<String>,
 }
 
-/// Sets the labels stamped on stored request logs. Can be set once per process; returns the
-/// rejected labels if already set. Rows written before this call have NULL labels.
+/// Sets the request log labels; they can be set once per process.
 pub fn set_request_log_labels(labels: RequestLogLabels) -> Result<(), RequestLogLabels> {
 	REQUEST_LOG_LABELS.set(labels)
 }
 
-fn request_log_labels() -> &'static RequestLogLabels {
-	static EMPTY: RequestLogLabels = RequestLogLabels {
-		gateway: None,
-		instance_id: None,
-	};
-	REQUEST_LOG_LABELS.get().unwrap_or(&EMPTY)
+fn request_log_labels() -> (Option<&'static str>, Option<&'static str>) {
+	let labels = REQUEST_LOG_LABELS.get();
+	(
+		labels.and_then(|l| l.gateway.as_deref()),
+		labels.and_then(|l| l.instance_id.as_deref()),
+	)
 }
 
 #[apply(schema!)]
@@ -821,10 +818,9 @@ impl Backend {
 	}
 
 	async fn insert_batch(&self, records: &[StoredRequestLog]) -> anyhow::Result<()> {
-		let labels = request_log_labels();
 		match self {
-			Self::Sqlite(store) => store.insert_batch(records, labels).await,
-			Self::Postgres(store) => store.insert_batch(records, labels).await,
+			Self::Sqlite(store) => store.insert_batch(records).await,
+			Self::Postgres(store) => store.insert_batch(records).await,
 		}
 	}
 
