@@ -5,9 +5,10 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, query_builder};
 use super::{
 	AnalyticsGroup, AnalyticsSummaryRequest, AnalyticsSummaryResponse, AnalyticsTimeBucket,
 	GenAiEntry, GetRequest, GetResponse, GroupBy, GroupByField, LogEntry, LogFilters, PayloadEntry,
-	SearchRequest, SearchResponse, StoredRequestLog, StoredRequestLogPayload, TailRequest,
-	TailResponse, TimeRange, TurnEntry, UsageEntry, analytics_window, attr_filter_values,
-	decode_cursor, encode_cursor, limit, promoted_attribute_column, prompt_preview, turn_kind,
+	RequestLogLabels, SearchRequest, SearchResponse, StoredRequestLog, StoredRequestLogPayload,
+	TailRequest, TailResponse, TimeRange, TurnEntry, UsageEntry, analytics_window,
+	attr_filter_values, decode_cursor, encode_cursor, limit, promoted_attribute_column,
+	prompt_preview, turn_kind,
 };
 
 pub struct SqliteLogStore {
@@ -15,7 +16,7 @@ pub struct SqliteLogStore {
 }
 
 const ANALYTICS_FILTER_OPTION_LIMIT: i64 = 500;
-// Leave room below SQLite's 32,766-parameter limit for two more log fields or one payload field.
+// 23 log fields per row stays below SQLite's 32,766-parameter limit.
 const LOG_INSERT_CHUNK_SIZE: usize = 1_400;
 const PAYLOAD_INSERT_CHUNK_SIZE: usize = 8_000;
 const INSERT_LOG_PREFIX: &str = r#"
@@ -23,7 +24,7 @@ INSERT INTO request_logs (
 	id, started_at, completed_at, duration_ms, trace_id, span_id, http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
 	input_tokens, output_tokens, total_tokens, cost, agentgateway_user, agentgateway_group,
-	user_agent_name, has_payload, attributes_json
+	user_agent_name, has_payload, attributes_json, gateway, instance_id
 ) 
 "#;
 
@@ -34,6 +35,7 @@ INSERT INTO request_log_payloads (log_id, request_prompt_json, response_completi
 fn push_request_log_row(
 	row: &mut query_builder::Separated<'_, Sqlite, &'static str>,
 	record: &StoredRequestLog,
+	labels: &RequestLogLabels,
 ) {
 	row
 		.push_bind(&record.id)
@@ -56,7 +58,9 @@ fn push_request_log_row(
 		.push_bind(&record.agentgateway_group)
 		.push_bind(&record.user_agent_name)
 		.push_bind(record.has_payload)
-		.push_bind(record.attributes_json.as_ref());
+		.push_bind(record.attributes_json.as_ref())
+		.push_bind(labels.gateway.as_deref())
+		.push_bind(labels.instance_id.as_deref());
 }
 
 fn push_request_log_payload_row(
@@ -73,10 +77,16 @@ fn push_request_log_payload_row(
 impl SqliteLogStore {
 	pub async fn from_pool(pool: SqlitePool) -> anyhow::Result<Self> {
 		sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+		add_missing_columns(&pool).await?;
+		sqlx::raw_sql(LABEL_INDEXES).execute(&pool).await?;
 		Ok(Self { pool })
 	}
 
-	pub async fn insert_batch(&self, records: &[StoredRequestLog]) -> anyhow::Result<()> {
+	pub async fn insert_batch(
+		&self,
+		records: &[StoredRequestLog],
+		labels: &RequestLogLabels,
+	) -> anyhow::Result<()> {
 		if records.is_empty() {
 			return Ok(());
 		}
@@ -84,7 +94,7 @@ impl SqliteLogStore {
 		for chunk in records.chunks(LOG_INSERT_CHUNK_SIZE) {
 			let mut logs = QueryBuilder::<Sqlite>::new(INSERT_LOG_PREFIX);
 			logs.push_values(chunk, |mut row, record| {
-				push_request_log_row(&mut row, record);
+				push_request_log_row(&mut row, record, labels);
 			});
 			logs.build().execute(&mut *tx).await?;
 		}
@@ -610,6 +620,54 @@ CREATE INDEX IF NOT EXISTS idx_request_logs_group_completed_at ON request_logs(a
 CREATE INDEX IF NOT EXISTS idx_request_logs_user_agent_completed_at ON request_logs(user_agent_name, completed_at DESC, id DESC);
 "#;
 
+/// Nullable columns added after the original schema. SQLite has no `ADD COLUMN IF NOT EXISTS`,
+/// so each is added only when `PRAGMA table_info` does not list it.
+const ADDED_COLUMNS: &[(&str, &str)] = &[
+	(
+		"gateway",
+		"ALTER TABLE request_logs ADD COLUMN gateway TEXT",
+	),
+	(
+		"instance_id",
+		"ALTER TABLE request_logs ADD COLUMN instance_id TEXT",
+	),
+];
+
+const LABEL_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_request_logs_gateway_completed_at ON request_logs(gateway, completed_at DESC, id DESC);
+"#;
+
+async fn request_log_columns(pool: &SqlitePool) -> anyhow::Result<Vec<String>> {
+	Ok(
+		sqlx::query("SELECT name FROM pragma_table_info('request_logs')")
+			.fetch_all(pool)
+			.await?
+			.into_iter()
+			.map(|row| row.try_get::<String, _>("name"))
+			.collect::<Result<_, _>>()?,
+	)
+}
+
+async fn add_missing_columns(pool: &SqlitePool) -> anyhow::Result<()> {
+	let columns = request_log_columns(pool).await?;
+	for (name, alter) in ADDED_COLUMNS {
+		if columns.iter().any(|column| column == name) {
+			continue;
+		}
+		if let Err(err) = sqlx::raw_sql(*alter).execute(pool).await {
+			// Another process may have added it concurrently.
+			if !request_log_columns(pool)
+				.await?
+				.iter()
+				.any(|column| column == name)
+			{
+				return Err(err.into());
+			}
+		}
+	}
+	Ok(())
+}
+
 const SELECT_LOGS: &str = r#"
 SELECT id, started_at, completed_at, duration_ms, trace_id, span_id, http_status, error,
 	gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, gen_ai_response_model,
@@ -628,3 +686,105 @@ FROM request_logs
 LEFT JOIN request_log_payloads ON request_logs.id = request_log_payloads.log_id
 WHERE request_logs.id = ?
 "#;
+
+#[cfg(test)]
+mod tests {
+	use chrono::Utc;
+
+	use super::*;
+
+	fn record(id: &str) -> StoredRequestLog {
+		StoredRequestLog {
+			id: id.to_string(),
+			started_at: Utc::now(),
+			completed_at: Utc::now(),
+			duration_ms: 1,
+			trace_id: None,
+			span_id: None,
+			http_status: Some(200),
+			error: None,
+			gen_ai_operation_name: None,
+			gen_ai_provider_name: None,
+			gen_ai_request_model: None,
+			gen_ai_response_model: None,
+			input_tokens: None,
+			output_tokens: None,
+			total_tokens: None,
+			cost: None,
+			agentgateway_user: None,
+			agentgateway_group: None,
+			user_agent_name: None,
+			has_payload: false,
+			attributes_json: "{}".into(),
+			payload: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn adds_label_columns_to_existing_databases_and_stamps_rows() {
+		let pool = sqlx::sqlite::SqlitePoolOptions::new()
+			.max_connections(1)
+			.connect("sqlite::memory:")
+			.await
+			.unwrap();
+		// A database created before the label columns existed.
+		sqlx::raw_sql(SCHEMA).execute(&pool).await.unwrap();
+		sqlx::query("INSERT INTO request_logs (id, started_at, completed_at, duration_ms, has_payload, attributes_json) VALUES ('old', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 1, 0, '{}')")
+			.execute(&pool)
+			.await
+			.unwrap();
+		assert!(
+			!request_log_columns(&pool)
+				.await
+				.unwrap()
+				.contains(&"gateway".to_string())
+		);
+
+		let store = SqliteLogStore::from_pool(pool.clone()).await.unwrap();
+		// Opening again is a no-op.
+		SqliteLogStore::from_pool(pool.clone()).await.unwrap();
+		let columns = request_log_columns(&pool).await.unwrap();
+		assert!(columns.contains(&"gateway".to_string()));
+		assert!(columns.contains(&"instance_id".to_string()));
+
+		store
+			.insert_batch(&[record("unlabeled")], &RequestLogLabels::default())
+			.await
+			.unwrap();
+		store
+			.insert_batch(
+				&[record("labeled")],
+				&RequestLogLabels {
+					gateway: Some("gateway-1".to_string()),
+					instance_id: Some("instance-1".to_string()),
+				},
+			)
+			.await
+			.unwrap();
+
+		let rows: Vec<(String, Option<String>, Option<String>)> =
+			sqlx::query_as("SELECT id, gateway, instance_id FROM request_logs ORDER BY id")
+				.fetch_all(&pool)
+				.await
+				.unwrap();
+		assert_eq!(
+			rows,
+			vec![
+				(
+					"labeled".to_string(),
+					Some("gateway-1".to_string()),
+					Some("instance-1".to_string())
+				),
+				("old".to_string(), None, None),
+				("unlabeled".to_string(), None, None),
+			]
+		);
+		let index: Option<String> = sqlx::query_scalar(
+			"SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_request_logs_gateway_completed_at'",
+		)
+		.fetch_optional(&pool)
+		.await
+		.unwrap();
+		assert!(index.is_some());
+	}
+}

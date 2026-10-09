@@ -255,6 +255,9 @@ impl BudgetExceededAction {
 pub struct MatchedBudgets {
 	pub(crate) api_key: String,
 	pub(crate) api_key_id: String,
+	/// Canonical scopes of the config row that defines these budgets. Empty or `["global"]` keeps
+	/// today's counter IDs; other scopes get their own counters (see [`scoped_budget_id`]).
+	pub(crate) scopes: Vec<String>,
 	pub(crate) budgets: Vec<Budget>,
 }
 
@@ -292,14 +295,32 @@ pub struct BudgetExceeded {
 	pub retry_after: u64,
 }
 
-fn budget_id(api_key_id: &str, budget: &Budget) -> String {
-	format!(
-		"api-key:{}:{}:{}:{}",
-		api_key_id.len(),
-		api_key_id,
-		budget.name.len(),
-		budget.name
+fn budget_id(api_key_id: &str, budget: &Budget, scopes: &[String]) -> String {
+	scoped_budget_id(
+		scopes,
+		format!(
+			"api-key:{}:{}:{}:{}",
+			api_key_id.len(),
+			api_key_id,
+			budget.name.len(),
+			budget.name
+		),
 	)
+}
+
+/// Prefixes a budget counter ID with the scopes of the config row that defines the budget, so
+/// the counter is shared by exactly the gateways that row applies to. Global (or empty) scopes
+/// return `budget_id` unchanged. Otherwise the result is
+/// `scopes:{len}:{scopes sorted and joined with ","}:{budget_id}`.
+pub fn scoped_budget_id(scopes: &[String], budget_id: String) -> String {
+	if crate::config_store::is_global_scopes(scopes) {
+		return budget_id;
+	}
+	let mut scopes = scopes.to_vec();
+	scopes.sort();
+	scopes.dedup();
+	let joined = scopes.join(",");
+	format!("scopes:{}:{joined}:{budget_id}", joined.len())
 }
 
 /// Returns the half-open fixed window `[start, end)` containing `now`.
@@ -392,7 +413,7 @@ impl BudgetPolicy {
 				continue;
 			};
 			for budget in &budgets.budgets {
-				let budget_id = budget_id(&budgets.api_key_id, budget);
+				let budget_id = budget_id(&budgets.api_key_id, budget, &budgets.scopes);
 				if let Some(registration) = &self.registration {
 					BudgetCounter::configured(&budgets.api_key, budget, now)?;
 					registration.insert(
@@ -423,7 +444,7 @@ impl BudgetPolicy {
 		let now = Utc::now();
 		let mut blocked = None;
 		for budget in &budgets.budgets {
-			let budget_id = budget_id(&budgets.api_key_id, budget);
+			let budget_id = budget_id(&budgets.api_key_id, budget, &budgets.scopes);
 			let (used, window_end) = {
 				let mut counter = self
 					.counters
@@ -493,7 +514,7 @@ impl BudgetPolicy {
 				continue;
 			};
 
-			let budget_id = budget_id(&budgets.api_key_id, budget);
+			let budget_id = budget_id(&budgets.api_key_id, budget, &budgets.scopes);
 			let Some(mut counter) = self.counters.get_mut(&budget_id) else {
 				tracing::warn!(target: "budget", budget_id, "budget counter was not registered before settlement");
 				continue;
@@ -577,6 +598,65 @@ mod tests {
 		assert_eq!(
 			err.to_string(),
 			"API key budgets require config.database to be configured"
+		);
+	}
+
+	#[test]
+	fn scoped_budget_ids_prefix_non_global_scopes() {
+		let base = "api-key:3:abc:6:tokens".to_string();
+		assert_eq!(scoped_budget_id(&[], base.clone()), base);
+		assert_eq!(
+			scoped_budget_id(&["global".to_string()], base.clone()),
+			base
+		);
+		assert_eq!(
+			scoped_budget_id(
+				&["gateway:b".to_string(), "gateway:a".to_string()],
+				base.clone()
+			),
+			"scopes:19:gateway:a,gateway:b:api-key:3:abc:6:tokens"
+		);
+
+		let keys = |metadata: serde_json::Value| -> crate::http::apikey::LocalAPIKeys {
+			serde_json::from_value(serde_json::json!({
+				"keys": [{
+					"key": "sk-budget",
+					"metadata": metadata,
+					"budgets": [{
+						"name": "tokens",
+						"limit": {"unit": "Tokens", "amount": 40},
+						"window": {"rolling": "1h"},
+						"onBudgetExceeded": "Block"
+					}]
+				}]
+			}))
+			.unwrap()
+		};
+		let budget_ids = |keys: crate::http::apikey::LocalAPIKeys| {
+			let policy = BudgetPolicy::default();
+			policy.register(&keys.compile().unwrap(), true).unwrap();
+			let mut ids = policy
+				.counters
+				.iter()
+				.map(|counter| counter.key().clone())
+				.collect::<Vec<_>>();
+			ids.sort();
+			ids
+		};
+		let global = budget_ids(keys(serde_json::json!({"name": "k"})));
+		assert!(global[0].starts_with("api-key:"), "{global:?}");
+		let explicit_global = budget_ids(keys(serde_json::json!({
+			"name": "k",
+			"agentgateway.dev/scopes": ["global"],
+		})));
+		assert_eq!(explicit_global, global);
+		let scoped = budget_ids(keys(serde_json::json!({
+			"name": "k",
+			"agentgateway.dev/scopes": ["gateway:b", "gateway:a"],
+		})));
+		assert_eq!(
+			scoped,
+			vec![format!("scopes:19:gateway:a,gateway:b:{}", global[0])]
 		);
 	}
 

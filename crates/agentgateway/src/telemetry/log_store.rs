@@ -18,6 +18,30 @@ mod sqlite;
 
 static REQUEST_LOG_STORE: OnceLock<RequestLogStore> = OnceLock::new();
 static REQUEST_LOG_STORE_BACKLOG: AtomicUsize = AtomicUsize::new(0);
+static REQUEST_LOG_LABELS: OnceLock<RequestLogLabels> = OnceLock::new();
+
+/// Process-wide labels stamped on every stored request log row. Unset labels are stored as NULL.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestLogLabels {
+	/// Name of the gateway deployment that served the request (`request_logs.gateway`).
+	pub gateway: Option<String>,
+	/// ID of the process that served the request (`request_logs.instance_id`).
+	pub instance_id: Option<String>,
+}
+
+/// Sets the labels stamped on stored request logs. Can be set once per process; returns the
+/// rejected labels if already set. Rows written before this call have NULL labels.
+pub fn set_request_log_labels(labels: RequestLogLabels) -> Result<(), RequestLogLabels> {
+	REQUEST_LOG_LABELS.set(labels)
+}
+
+fn request_log_labels() -> &'static RequestLogLabels {
+	static EMPTY: RequestLogLabels = RequestLogLabels {
+		gateway: None,
+		instance_id: None,
+	};
+	REQUEST_LOG_LABELS.get().unwrap_or(&EMPTY)
+}
 
 #[apply(schema!)]
 #[derive(Eq, PartialEq)]
@@ -797,9 +821,10 @@ impl Backend {
 	}
 
 	async fn insert_batch(&self, records: &[StoredRequestLog]) -> anyhow::Result<()> {
+		let labels = request_log_labels();
 		match self {
-			Self::Sqlite(store) => store.insert_batch(records).await,
-			Self::Postgres(store) => store.insert_batch(records).await,
+			Self::Sqlite(store) => store.insert_batch(records, labels).await,
+			Self::Postgres(store) => store.insert_batch(records, labels).await,
 		}
 	}
 
